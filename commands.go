@@ -558,3 +558,263 @@ func (p *DefaultProfile) IMEI() (str string, err error) {
 	str, err = p.dev.Send(`AT+GSN`)
 	return
 }
+
+// Air72x
+type Air72xProfile struct {
+	dev *Device
+	DeviceProfile
+}
+
+func (p *Air72xProfile) Init(d *Device) (err error) {
+	p.dev = d
+	p.dev.Send(NoopCmd) // kinda flush
+	if err = p.COPS(true, true); err != nil {
+		return fmt.Errorf("at init: unable to adjust the format of operator's name: %w", err)
+	}
+	var info *SystemInfoReport
+	if info, err = p.SYSINFO(); err != nil {
+		return fmt.Errorf("at init: unable to read system info: %w", err)
+	}
+	p.dev.State = &DeviceState{
+		ServiceState:  info.ServiceState,
+		ServiceDomain: info.ServiceDomain,
+		RoamingState:  info.RoamingState,
+		SystemMode:    info.SystemMode,
+		SystemSubmode: info.SystemSubmode,
+		SimState:      info.SimState,
+	}
+	if p.dev.State.OperatorName, err = p.OperatorName(); err != nil {
+		return fmt.Errorf("at init: unable to read operator's name: %w", err)
+	}
+	if p.dev.State.ModelName, err = p.ModelName(); err != nil {
+		return fmt.Errorf("at init: unable to read modem's model name: %w", err)
+	}
+	if p.dev.State.IMEI, err = p.IMEI(); err != nil {
+		return fmt.Errorf("at init: unable to read modem's IMEI code: %w", err)
+	}
+	if err = p.CMGF(false); err != nil {
+		return fmt.Errorf("at init: unable to switch message format to PDU: %w", err)
+	}
+	if err = p.CPMS(MemoryTypes.Sim, MemoryTypes.Sim, MemoryTypes.Sim); err != nil {
+		return fmt.Errorf("at init: unable to set messages storage: %w", err)
+	}
+	if err = p.CNMI(2, 2, 0, 0, 0); err != nil {
+		return fmt.Errorf("at init: unable to turn on message notifications: %w", err)
+	}
+	if err = p.CLIP(true); err != nil {
+		return fmt.Errorf("at init: unable to turn on calling party ID notifications: %w", err)
+	}
+
+	return p.FetchInbox()
+}
+
+func (p *Air72xProfile) FetchInbox() error {
+	slots, err := p.CMGL(MessageFlags.Any)
+	if err != nil {
+		return fmt.Errorf("unable to check message inbox: %w", err)
+	}
+
+	for i := range slots {
+		var msg sms.Message
+		if _, err := msg.ReadFrom(slots[i].Payload); err != nil {
+			return fmt.Errorf("error while parsing message inbox: %w", err)
+		}
+		// if err := p.CMGD(slots[i].Index, DeleteOptions.Index); err != nil {
+		// 	return fmt.Errorf("error while cleaning message inbox: %w", err)
+		// }
+		p.dev.messages <- &msg
+	}
+	return nil
+}
+
+// 发送短信
+func (p *Air72xProfile) CMGS(length int, octets []byte) (byte, error) {
+	part1 := fmt.Sprintf("AT+CMGS=%d", length)
+	part2 := fmt.Sprintf("%02X", octets)
+	reply, err := p.dev.sendInteractive(part1, part2, byte('>'))
+
+	if err != nil {
+		return 0, err
+	}
+
+	if !strings.HasPrefix(reply, "+CMGS: ") {
+		return 0, fmt.Errorf("unable to get sequence number of reply '%s'", reply)
+	}
+
+	number, err := parseUint8(reply[7:])
+	if err != nil {
+		return 0, fmt.Errorf("unable to parse sequence number of reply '%s': %w", reply, err)
+	}
+
+	return byte(number), nil
+}
+
+func (p *Air72xProfile) CUSD(reporting Opt, octets []byte, enc Encoding) (err error) {
+	return errors.New("this method is unavailable")
+}
+
+// 读取短信
+func (p *Air72xProfile) CMGR(index uint16) (octets []byte, err error) {
+	req := fmt.Sprintf(`AT+CMGR=%d`, index)
+	reply, err := p.dev.Send(req)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(reply, "\n")
+	if len(lines) < 2 {
+		return nil, ErrParseReport
+	}
+	octets, err = util.Bytes(lines[1])
+	return
+}
+
+// 删除短信
+func (p *Air72xProfile) CMGD(index uint16, option Opt) (err error) {
+	req := fmt.Sprintf(`AT+CMGD=%d,%d`, index, option.ID)
+	_, err = p.dev.Send(req)
+	return
+}
+
+// 列举短信
+func (p *Air72xProfile) CMGL(flag Opt) (result []MessageSlot, err error) {
+	req := fmt.Sprintf(`AT+CMGL=%d`, flag.ID)
+	reply, err := p.dev.Send(req)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(reply, "\n")
+	if len(lines) < 2 {
+		return
+	}
+
+	for i := 0; i < len(lines); i += 2 {
+		header := strings.TrimPrefix(lines[i], `+CMGL: `)
+		fields := strings.Split(header, ",")
+		if len(fields) < 4 {
+			return nil, ErrParseReport
+		}
+		n, err := parseUint16(fields[0])
+		if err != nil {
+			return nil, ErrParseReport
+		}
+		var oct []byte
+		if oct, err = util.Bytes(lines[i+1]); err != nil {
+			return nil, ErrParseReport
+		}
+
+		result = append(result, MessageSlot{
+			Index:   n,
+			Payload: oct,
+		})
+	}
+	return
+}
+
+// 设置短信格式
+func (p *Air72xProfile) CMGF(text bool) (err error) {
+	var flag int
+	if text {
+		flag = 1
+	}
+	req := fmt.Sprintf(`AT+CMGF=%d`, flag)
+	_, err = p.dev.Send(req)
+	return
+}
+
+// 设置主叫号码显示
+func (p *Air72xProfile) CLIP(text bool) (err error) {
+	var flag int
+	if text {
+		flag = 1
+	}
+	req := fmt.Sprintf(`AT+CLIP=%d`, flag)
+	_, err = p.dev.Send(req)
+	return
+}
+
+// 挂断通话
+func (p *Air72xProfile) CHUP() (err error) {
+	req := "ATH+CHUP"
+	_, err = p.dev.Send(req)
+	return
+}
+
+// 新消息指示
+func (p *Air72xProfile) CNMI(mode, mt, bm, ds, bfr int) (err error) {
+	req := fmt.Sprintf(`AT+CNMI=%d,%d,%d,%d,%d`, mode, mt, bm, ds, bfr)
+	_, err = p.dev.Send(req)
+	return
+}
+
+// 短信优先存储区域选择
+func (p *Air72xProfile) CPMS(mem1 StringOpt, mem2 StringOpt, mem3 StringOpt) (err error) {
+	req := fmt.Sprintf(`AT+CPMS="%s","%s","%s"`, mem1.ID, mem2.ID, mem3.ID)
+	_, err = p.dev.Send(req)
+	return
+}
+
+func (p *Air72xProfile) BOOT(token uint64) (err error) {
+	return errors.New("this method is unavailable")
+}
+
+// 仅用于漫游模式切换
+func (p *Air72xProfile) SYSCFG(roaming, cellular bool) (err error) {
+	var roam int
+	if roaming {
+		// 0: roaming disabled
+		// 1: roaming enabled
+		roam = 1
+	}
+	req := fmt.Sprintf(`AT^SYSCONFIG=2,3,%d,%d`, roam, 2)
+	_, err = p.dev.Send(req)
+	return
+}
+
+func (p *Air72xProfile) SYSINFO() (info *SystemInfoReport, err error) {
+	reply, err := p.dev.Send(`AT^SYSINFO`)
+	if err != nil {
+		return nil, err
+	}
+	info = new(SystemInfoReport)
+	err = info.Parse(strings.TrimPrefix(reply, `^SYSINFO:`))
+	return
+}
+
+// 选择运营商
+func (p *Air72xProfile) COPS(auto bool, text bool) (err error) {
+	var a, t int
+	if auto {
+		// 0: 自动注册运营商
+		a = 0
+	}
+	if text {
+		// 2: 运营商的格式为数字式字符串型
+		t = 2
+	}
+	// AT+COPS=<mode>[,<format>[,<oper>[,<AcT>[,<Domain>]]]]
+	req := fmt.Sprintf(`AT+COPS=%d,%d`, a, t)
+	_, err = p.dev.Send(req)
+	return
+}
+
+// 查询运营商
+func (p *Air72xProfile) OperatorName() (str string, err error) {
+	result, err := p.dev.Send(`AT+COPS?`)
+	fields := strings.Split(strings.TrimPrefix(result, `+COPS: `), ",")
+	if len(fields) < 4 {
+		err = ErrParseReport
+		return
+	}
+	str = strings.TrimLeft(strings.TrimRight(fields[2], `"`), `"`)
+	return
+}
+
+func (p *Air72xProfile) ModelName() (str string, err error) {
+	str, err = p.dev.Send(`AT+CGMM`)
+	return
+}
+
+func (p *Air72xProfile) IMEI() (str string, err error) {
+	str, err = p.dev.Send(`AT+CGSN`)
+	return
+}

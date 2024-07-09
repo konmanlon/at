@@ -382,6 +382,8 @@ func (d *Device) Open() (err error) {
 			d.cmdPort.Close()
 			return
 		}
+	} else {
+		d.notifyPort = d.cmdPort
 	}
 	return
 }
