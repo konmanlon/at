@@ -473,7 +473,7 @@ type SystemInfoReport struct {
 // Parse scans the AT^SYSINFO report into a non-nil SystemInfoReport struct.
 func (s *SystemInfoReport) Parse(str string) (err error) {
 	fields := strings.Split(str, ",")
-	if len(fields) < 7 {
+	if len(fields) < 6 {
 		return ErrParseReport
 	}
 
@@ -503,7 +503,7 @@ func (s *SystemInfoReport) Parse(str string) (err error) {
 	if err = fetch(fields[4], &s.SimState, SimStates.Resolve); err != nil {
 		return ErrParseReport
 	}
-	if err = fetch(fields[6], &s.SystemSubmode, SystemSubmodes.Resolve); err != nil {
+	if err = fetch(fields[5], &s.SystemSubmode, SystemSubmodes.Resolve); err != nil {
 		return ErrParseReport
 	}
 	return nil
@@ -560,6 +560,10 @@ func (p *DefaultProfile) IMEI() (str string, err error) {
 }
 
 // Air72x
+func DeviceAir72x() DeviceProfile {
+	return &Air72xProfile{}
+}
+
 type Air72xProfile struct {
 	dev *Device
 	DeviceProfile
@@ -567,30 +571,12 @@ type Air72xProfile struct {
 
 func (p *Air72xProfile) Init(d *Device) (err error) {
 	p.dev = d
-	p.dev.Send(NoopCmd) // kinda flush
-	if err = p.COPS(true, true); err != nil {
-		return fmt.Errorf("at init: unable to adjust the format of operator's name: %w", err)
-	}
-	var info *SystemInfoReport
-	if info, err = p.SYSINFO(); err != nil {
-		return fmt.Errorf("at init: unable to read system info: %w", err)
-	}
-	p.dev.State = &DeviceState{
-		ServiceState:  info.ServiceState,
-		ServiceDomain: info.ServiceDomain,
-		RoamingState:  info.RoamingState,
-		SystemMode:    info.SystemMode,
-		SystemSubmode: info.SystemSubmode,
-		SimState:      info.SimState,
-	}
-	if p.dev.State.OperatorName, err = p.OperatorName(); err != nil {
-		return fmt.Errorf("at init: unable to read operator's name: %w", err)
-	}
-	if p.dev.State.ModelName, err = p.ModelName(); err != nil {
-		return fmt.Errorf("at init: unable to read modem's model name: %w", err)
-	}
-	if p.dev.State.IMEI, err = p.IMEI(); err != nil {
-		return fmt.Errorf("at init: unable to read modem's IMEI code: %w", err)
+	if state, err := p.CPAS(); err != nil {
+		return fmt.Errorf("at init: unable to query activity status: %w", err)
+	} else {
+		if state == "+CPAS: 1" {
+			return fmt.Errorf("at init: module not available: %s", state)
+		}
 	}
 	if err = p.CMGF(false); err != nil {
 		return fmt.Errorf("at init: unable to switch message format to PDU: %w", err)
@@ -598,7 +584,7 @@ func (p *Air72xProfile) Init(d *Device) (err error) {
 	if err = p.CPMS(MemoryTypes.Sim, MemoryTypes.Sim, MemoryTypes.Sim); err != nil {
 		return fmt.Errorf("at init: unable to set messages storage: %w", err)
 	}
-	if err = p.CNMI(2, 2, 0, 0, 0); err != nil {
+	if err = p.CNMI(2, 1, 0, 0, 0); err != nil {
 		return fmt.Errorf("at init: unable to turn on message notifications: %w", err)
 	}
 	if err = p.CLIP(true); err != nil {
@@ -608,6 +594,7 @@ func (p *Air72xProfile) Init(d *Device) (err error) {
 	return p.FetchInbox()
 }
 
+// 启动时读取短信并将已读取短信删除
 func (p *Air72xProfile) FetchInbox() error {
 	slots, err := p.CMGL(MessageFlags.Any)
 	if err != nil {
@@ -619,9 +606,12 @@ func (p *Air72xProfile) FetchInbox() error {
 		if _, err := msg.ReadFrom(slots[i].Payload); err != nil {
 			return fmt.Errorf("error while parsing message inbox: %w", err)
 		}
-		// if err := p.CMGD(slots[i].Index, DeleteOptions.Index); err != nil {
-		// 	return fmt.Errorf("error while cleaning message inbox: %w", err)
-		// }
+		// 删除短信
+		if err := p.CMGD(slots[i].Index, DeleteOptions.Index); err != nil {
+			return fmt.Errorf("error while cleaning message inbox: %w", err)
+		}
+
+		// 将短信消息写入通道，用 IncomingSms() 方法读取通道
 		p.dev.messages <- &msg
 	}
 	return nil
@@ -739,7 +729,10 @@ func (p *Air72xProfile) CHUP() (err error) {
 	return
 }
 
-// 新消息指示
+// CNMI: 新消息指示
+// 设置格式: AT+CNMI=[<mode>[,<mt>[,<bm>[,<ds>[,<bfr>]]]]]
+// AT+CNMI=2,1: <mt>=1时, 收到一个短信，缓存在<mem1>中，只用+CMTI上报新短信位置索引
+// AT+CNMI=2,2: <mt>=2时, 即新短信不缓存，直接上报
 func (p *Air72xProfile) CNMI(mode, mt, bm, ds, bfr int) (err error) {
 	req := fmt.Sprintf(`AT+CNMI=%d,%d,%d,%d,%d`, mode, mt, bm, ds, bfr)
 	_, err = p.dev.Send(req)
@@ -776,7 +769,7 @@ func (p *Air72xProfile) SYSINFO() (info *SystemInfoReport, err error) {
 		return nil, err
 	}
 	info = new(SystemInfoReport)
-	err = info.Parse(strings.TrimPrefix(reply, `^SYSINFO:`))
+	err = info.Parse(strings.TrimPrefix(reply, `^SYSINFO: `))
 	return
 }
 
@@ -816,5 +809,20 @@ func (p *Air72xProfile) ModelName() (str string, err error) {
 
 func (p *Air72xProfile) IMEI() (str string, err error) {
 	str, err = p.dev.Send(`AT+CGSN`)
+	return
+}
+
+/*
+模块活动状态：
+0 ME准备就绪
+1 ME不可用
+2 未知，ME未准备好
+3 振铃
+4 呼叫进行中
+5 睡眠
+6 call inactive
+*/
+func (p *Air72xProfile) CPAS() (str string, err error) {
+	str, err = p.dev.Send(`AT+CPAS`)
 	return
 }
