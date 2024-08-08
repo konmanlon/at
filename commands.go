@@ -571,13 +571,6 @@ type Air72xProfile struct {
 
 func (p *Air72xProfile) Init(d *Device) (err error) {
 	p.dev = d
-	if state, err := p.CPAS(); err != nil {
-		return fmt.Errorf("at init: unable to query activity status: %w", err)
-	} else {
-		if state == "+CPAS: 1" {
-			return fmt.Errorf("at init: module not available: %s", state)
-		}
-	}
 	if err = p.CMGF(false); err != nil {
 		return fmt.Errorf("at init: unable to switch message format to PDU: %w", err)
 	}
@@ -809,20 +802,5 @@ func (p *Air72xProfile) ModelName() (str string, err error) {
 
 func (p *Air72xProfile) IMEI() (str string, err error) {
 	str, err = p.dev.Send(`AT+CGSN`)
-	return
-}
-
-/*
-模块活动状态：
-0 ME准备就绪
-1 ME不可用
-2 未知，ME未准备好
-3 振铃
-4 呼叫进行中
-5 睡眠
-6 call inactive
-*/
-func (p *Air72xProfile) CPAS() (str string, err error) {
-	str, err = p.dev.Send(`AT+CPAS`)
 	return
 }
